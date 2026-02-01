@@ -16,7 +16,7 @@ Bybit Spot borsasında, belirli bir takip listesindeki coinleri saniyeler içind
 
 ## 2. Strateji ve Algoritma Mantığı (Kritik)
 
-Bot, her coin için şu 2 ana filtreyi doğrulamalıdır:
+Bot, her coin için şu 3 ana filtreyi doğrulamalıdır:
 
 **A. Hacim Patlaması (Volume Spike)**  
 Mevcut 1 dakikalık mumun hacmi, geçmiş 30 dakika ile 10 dakika arasındaki "temiz" dönemin **medyan hacminden en az 5 kat (5x)** büyük olmalıdır.  
@@ -24,6 +24,9 @@ Mevcut 1 dakikalık mumun hacmi, geçmiş 30 dakika ile 10 dakika arasındaki "t
 
 **B. Fiyat Sabitliği (Body Change)**  
 Hacim patlamasına rağmen fiyatın ilerleyemediğini doğrulamak için; 1 dakikalık mumun açılış ve kapanış fiyatı arasındaki fark (gövde) **%0.05 veya daha az** olmalıdır.
+
+**C. Kademe Bazlı Makas (Tick-Based Spread)**  
+Yüzdesel spread yerine, coinin **tickSize** (minimum fiyat adımı) birimi kullanılmalıdır. Alış ve satış arasındaki fark **en fazla 5 kademe (5 Ticks)** olmalıdır.
 
 ## 3. Dinamik Derinlik Takibi (Order Book Analysis)
 
@@ -41,7 +44,8 @@ Eğer anlık derinlik, o coinin geçmiş derinlik ortalamasının **3 katı (3x)
 ## 5. Özet Analiz Akışı (Pseudo-Code)
 
 1. Bybit'ten ilgili coinin **Order Book** ve **1m mum** verisini çek.  
-2. Order Book derinligini hesapla ve olasi **"duvar"** etiketini belirle.  
-3. Son 40 mumun verisini çek, hacim ve fiyat gövde değişimini hesapla.  
-4. **Hacim > 5x** ve **Değişim < %0.05** sağlanırsa bildirim gönder.  
-5. Hata oluşursa (İnternet/API) **10 saniye bekle** ve döngüyü sürdür.
+2. Alış/Satış farkı **> 5 tick** ise işlemi sonlandır.  
+3. Order Book derinligini hesapla ve olasi **"duvar"** etiketini belirle.  
+4. Son 40 mumun verisini çek, hacim ve fiyat gövde değişimini hesapla.  
+5. **Hacim > 5x** ve **Değişim < %0.05** sağlanırsa bildirim gönder.  
+6. Hata oluşursa (İnternet/API) **10 saniye bekle** ve döngüyü sürdür.

@@ -12,7 +12,6 @@ TELEGRAM_CHAT_ID = "5448895488"
 # --- STRATEJI AYARLARI ---
 VOLUME_THRESHOLD = 5.0         # Hacim en az 5 KAT artmis olmali
 BODY_STABILITY_PERCENT = 0.05  # Degisim kesinlikle %0.05 ve alti olmali
-MAX_ALLOWED_TICKS = 5          # Makas 5 tick'ten fazlaysa ASLA bildirme
 DEPTH_MULTIPLIER_TARGET = 3.0  # Tahta 3 kat dolmussa "DUVAR" ibaresi ekle
 ORDERBOOK_LIMIT = 20
 ORDER_COUNT_MIN_NOTIONAL = 5.0
@@ -20,7 +19,6 @@ ORDER_COUNT_MULTIPLIER_TARGET = 1.5
 IMBALANCE_RATIO_MIN = 1.3
 COOLDOWN_SECONDS = 60
 STREAK_WINDOW_SECONDS = 130
-MARKET_CACHE_TTL_SECONDS = 1800
 SCAN_SLEEP_SECONDS = 1.2
 RETRY_ATTEMPTS = 3
 RETRY_BASE_SLEEP = 1.0
@@ -41,13 +39,10 @@ ask_depth_memory = {}
 order_count_memory = {}
 bid_order_count_memory = {}
 ask_order_count_memory = {}
-market_info_cache = {}
 alert_streaks = {}
 alert_last_sent = {}
 pending_alerts = {}
 last_candle_ts = {}
-market_cache = None
-market_cache_loaded_at = 0.0
 
 exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "spot"}})
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -73,58 +68,6 @@ def safe_fetch(callable_fn, *args, **kwargs):
         except Exception:
             break
     return None
-
-
-def load_markets_cached():
-    global market_cache, market_cache_loaded_at
-    now = time.time()
-    if market_cache and now - market_cache_loaded_at < MARKET_CACHE_TTL_SECONDS:
-        return market_cache
-
-    markets = safe_fetch(exchange.load_markets)
-    if markets:
-        market_cache = markets
-        market_cache_loaded_at = now
-    return market_cache
-
-
-def _tick_size_from_market(market):
-    precision = market.get("precision", {}).get("price")
-    if precision is not None:
-        try:
-            precision_value = float(precision)
-            if precision_value.is_integer():
-                return 10 ** (-int(precision_value))
-            if precision_value > 0:
-                return precision_value
-        except (TypeError, ValueError):
-            pass
-
-    info = market.get("info") or {}
-    price_filter = info.get("priceFilter") or info.get("price_filter") or {}
-    tick = price_filter.get("tickSize") or price_filter.get("tick_size")
-    if tick is not None:
-        try:
-            return float(tick)
-        except (TypeError, ValueError):
-            pass
-    return None
-
-
-def get_tick_size(symbol):
-    if symbol in market_info_cache:
-        return market_info_cache[symbol]
-    try:
-        markets = load_markets_cached()
-        if not markets or symbol not in markets:
-            return None
-        tick_size = _tick_size_from_market(markets[symbol])
-        if not tick_size:
-            return None
-        market_info_cache[symbol] = tick_size
-        return tick_size
-    except Exception:
-        return None
 
 
 def _volumes_window(ohlcv, candle_index):
@@ -159,23 +102,13 @@ def _ratio_to_median(value, memory_list):
 
 def analyze_bybit(symbol, candle_index=-1):
     try:
-        tick_size = get_tick_size(symbol)
-        if not tick_size:
-            return False, None, None
-
-        # 1. Tahta Analizi (Makas Kontrolu)
+        # 1. Tahta Analizi
         orderbook = safe_fetch(exchange.fetch_order_book, symbol, limit=ORDERBOOK_LIMIT)
         if not orderbook:
             return False, None, None
         bid = orderbook["bids"][0][0] if orderbook["bids"] else 0
         ask = orderbook["asks"][0][0] if orderbook["asks"] else 0
         if not bid or not ask or ask < bid:
-            return False, None, None
-
-        spread_ticks = round((ask - bid) / tick_size)
-
-        # KRITER: 5 tick'ten fazla makas varsa iptal
-        if spread_ticks > MAX_ALLOWED_TICKS:
             return False, None, None
 
         bid_depth = sum(b[0] * b[1] for b in orderbook["bids"][:5])
@@ -255,7 +188,7 @@ def analyze_bybit(symbol, candle_index=-1):
             ask_order_count_memory[symbol].pop(0)
 
         # --- KESIN KARAR ---
-        # Hacim >= 5x VE Degisim <= %0.05 VE Makas <= 5 Tick
+        # Hacim >= 5x VE Degisim <= %0.05
         dominant_side = None
         bid_imbalance = (
             bid_depth > 0 and ask_depth > 0 and (bid_depth / ask_depth) >= IMBALANCE_RATIO_MIN
@@ -287,7 +220,6 @@ def analyze_bybit(symbol, candle_index=-1):
             and dominant_side is not None
         ):
             return True, {
-                "ticks": spread_ticks,
                 "vol_ratio": vol_ratio,
                 "price": close_p,
                 "body_ch": body_change,
@@ -407,7 +339,6 @@ def scanner_loop():
                                     f"*{header}* ({symbol})\n\n"
                                     f"📈 *Hacim Artışı:* {confirmed_data['vol_ratio']:.1f} KAT ✅\n"
                                     f"📊 *Değişim:* %{confirmed_data['body_ch']:.4f}\n"
-                                    f"📏 *Makas:* {confirmed_data['ticks']} Tick\n"
                                     f"🌊 *Derinlik:* {confirmed_data['depth_ratio']:.1f} Kat\n"
                                     f"{wall_line}\n"
                                     f"{order_count_line}\n"
@@ -455,7 +386,7 @@ def telegram_commands(message):
         else:
             bot.reply_to(
                 message,
-                "🤖 Bot Aktif!\nKriter: 5x Hacim, 5-Tick Makas, %0.05 Değişim.",
+                "🤖 Bot Aktif!\nKriter: 5x Hacim, %0.05 Değişim, emir yogunlugu.",
             )
     except Exception:
         pass

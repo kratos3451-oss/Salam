@@ -14,6 +14,9 @@ VOLUME_THRESHOLD = 5.0         # Hacim en az 5 KAT artmis olmali
 BODY_STABILITY_PERCENT = 0.05  # Degisim kesinlikle %0.05 ve alti olmali
 MAX_ALLOWED_TICKS = 5          # Makas 5 tick'ten fazlaysa ASLA bildirme
 DEPTH_MULTIPLIER_TARGET = 3.0  # Tahta 3 kat dolmussa "DUVAR" ibaresi ekle
+ORDERBOOK_LIMIT = 20
+ORDER_COUNT_MIN_NOTIONAL = 5.0
+ORDER_COUNT_MULTIPLIER_TARGET = 1.5
 COOLDOWN_SECONDS = 60
 STREAK_WINDOW_SECONDS = 130
 MARKET_CACHE_TTL_SECONDS = 1800
@@ -32,6 +35,7 @@ watched_coins = {
 
 watched_coins_lock = threading.Lock()
 depth_memory = {}
+order_count_memory = {}
 market_info_cache = {}
 alert_streaks = {}
 alert_last_sent = {}
@@ -132,6 +136,14 @@ def _volumes_window(ohlcv, candle_index):
     return [c[5] for c in ohlcv[start : end + 1]]
 
 
+def _count_active_levels(levels):
+    count = 0
+    for price, amount in levels:
+        if price * amount >= ORDER_COUNT_MIN_NOTIONAL:
+            count += 1
+    return count
+
+
 def analyze_bybit(symbol, candle_index=-1):
     try:
         tick_size = get_tick_size(symbol)
@@ -139,7 +151,7 @@ def analyze_bybit(symbol, candle_index=-1):
             return False, None, None
 
         # 1. Tahta Analizi (Makas Kontrolu)
-        orderbook = safe_fetch(exchange.fetch_order_book, symbol, limit=10)
+        orderbook = safe_fetch(exchange.fetch_order_book, symbol, limit=ORDERBOOK_LIMIT)
         if not orderbook:
             return False, None, None
         bid = orderbook["bids"][0][0] if orderbook["bids"] else 0
@@ -155,6 +167,9 @@ def analyze_bybit(symbol, candle_index=-1):
 
         current_depth = sum(b[0] * b[1] for b in orderbook["bids"][:5]) + sum(
             a[0] * a[1] for a in orderbook["asks"][:5]
+        )
+        current_order_count = _count_active_levels(orderbook["bids"]) + _count_active_levels(
+            orderbook["asks"]
         )
 
         # 2. Mum Verileri (Stabilite Kontrolu)
@@ -190,15 +205,36 @@ def analyze_bybit(symbol, candle_index=-1):
         if len(depth_memory[symbol]) > 20:
             depth_memory[symbol].pop(0)
 
+        if symbol not in order_count_memory:
+            order_count_memory[symbol] = []
+        if len(order_count_memory[symbol]) > 5:
+            count_median = statistics.median(order_count_memory[symbol])
+            if count_median > 0:
+                order_count_ratio = current_order_count / count_median
+            else:
+                order_count_ratio = 1.0
+        else:
+            order_count_ratio = 1.0
+
+        order_count_memory[symbol].append(current_order_count)
+        if len(order_count_memory[symbol]) > 20:
+            order_count_memory[symbol].pop(0)
+
         # --- KESIN KARAR ---
         # Hacim >= 5x VE Degisim <= %0.05 VE Makas <= 5 Tick
-        if vol_ratio >= VOLUME_THRESHOLD and body_change <= BODY_STABILITY_PERCENT:
+        if (
+            vol_ratio >= VOLUME_THRESHOLD
+            and body_change <= BODY_STABILITY_PERCENT
+            and order_count_ratio >= ORDER_COUNT_MULTIPLIER_TARGET
+        ):
             return True, {
                 "ticks": spread_ticks,
                 "vol_ratio": vol_ratio,
                 "price": close_p,
                 "body_ch": body_change,
                 "depth_ratio": depth_ratio,
+                "order_count_ratio": order_count_ratio,
+                "order_count": current_order_count,
                 "is_wall": depth_ratio >= DEPTH_MULTIPLIER_TARGET,
                 "candle_ts": candle_ts,
             }, candle_ts
@@ -283,6 +319,10 @@ def scanner_loop():
                                     if confirmed_data["is_wall"]
                                     else "🧱 *Duvar:* Hayır"
                                 )
+                                order_count_line = (
+                                    f"📚 *Emir Yogunlugu:* {confirmed_data['order_count_ratio']:.2f}x "
+                                    f"({confirmed_data['order_count']})"
+                                )
 
                                 msg = (
                                     f"*{header}* ({symbol})\n\n"
@@ -291,6 +331,7 @@ def scanner_loop():
                                     f"📏 *Makas:* {confirmed_data['ticks']} Tick\n"
                                     f"🌊 *Derinlik:* {confirmed_data['depth_ratio']:.1f} Kat\n"
                                     f"{wall_line}\n"
+                                    f"{order_count_line}\n"
                                     f"💰 *Fiyat:* {confirmed_data['price']}"
                                 )
 

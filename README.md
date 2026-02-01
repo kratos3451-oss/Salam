@@ -28,6 +28,9 @@ Hacim patlamasına rağmen fiyatın ilerleyemediğini doğrulamak için; 1 dakik
 **C. Kademe Bazlı Makas (Tick-Based Spread)**  
 Yüzdesel spread yerine, coinin **tickSize** (minimum fiyat adımı) birimi kullanılmalıdır. Alış ve satış arasındaki fark **en fazla 5 kademe (5 Ticks)** olmalıdır.
 
+**D. Emir Yogunlugu Artisi (Order Count Spike)**  
+Tahtanin ilk seviyelerinde, anlamli tutardaki emir sayisi (notional >= belirli esik) **gecmis ortalamaya gore artmis** olmalidir. Bu, fiyat sabitken "suni emir yigmalarini" ayirt etmeye yardim eder.
+
 ## 3. Dinamik Derinlik Takibi (Order Book Analysis)
 
 Bot, her taramada tahtanın (Order Book) ilk 5 kademesindeki **USDT derinliğini** kaydetmelidir.

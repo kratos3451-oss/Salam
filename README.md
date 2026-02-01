@@ -31,6 +31,9 @@ Yüzdesel spread yerine, coinin **tickSize** (minimum fiyat adımı) birimi kull
 **D. Emir Yogunlugu Artisi (Order Count Spike)**  
 Tahtanin ilk seviyelerinde, anlamli tutardaki emir sayisi (notional >= belirli esik) **gecmis ortalamaya gore artmis** olmalidir. Bu, fiyat sabitken "suni emir yigmalarini" ayirt etmeye yardim eder.
 
+**E. Tek Tarafli Emir Yigma (Side Imbalance)**  
+Piyasa yapici/absorpsiyon davranisi icin, emir yogunlugu ve derinlik artisi **tek bir tarafta** (bid veya ask) belirgin olmalidir. Bu sayede "her iki tarafta eszamanli likidite artisi" gibi alakasiz durumlar elenir.
+
 ## 3. Dinamik Derinlik Takibi (Order Book Analysis)
 
 Bot, her taramada tahtanın (Order Book) ilk 5 kademesindeki **USDT derinliğini** kaydetmelidir.

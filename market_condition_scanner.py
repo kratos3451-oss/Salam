@@ -17,6 +17,7 @@ DEPTH_MULTIPLIER_TARGET = 3.0  # Tahta 3 kat dolmussa "DUVAR" ibaresi ekle
 ORDERBOOK_LIMIT = 20
 ORDER_COUNT_MIN_NOTIONAL = 5.0
 ORDER_COUNT_MULTIPLIER_TARGET = 1.5
+IMBALANCE_RATIO_MIN = 1.3
 COOLDOWN_SECONDS = 60
 STREAK_WINDOW_SECONDS = 130
 MARKET_CACHE_TTL_SECONDS = 1800
@@ -35,7 +36,11 @@ watched_coins = {
 
 watched_coins_lock = threading.Lock()
 depth_memory = {}
+bid_depth_memory = {}
+ask_depth_memory = {}
 order_count_memory = {}
+bid_order_count_memory = {}
+ask_order_count_memory = {}
 market_info_cache = {}
 alert_streaks = {}
 alert_last_sent = {}
@@ -144,6 +149,14 @@ def _count_active_levels(levels):
     return count
 
 
+def _ratio_to_median(value, memory_list):
+    if len(memory_list) > 5:
+        median_value = statistics.median(memory_list)
+        if median_value > 0:
+            return value / median_value
+    return 1.0
+
+
 def analyze_bybit(symbol, candle_index=-1):
     try:
         tick_size = get_tick_size(symbol)
@@ -165,12 +178,13 @@ def analyze_bybit(symbol, candle_index=-1):
         if spread_ticks > MAX_ALLOWED_TICKS:
             return False, None, None
 
-        current_depth = sum(b[0] * b[1] for b in orderbook["bids"][:5]) + sum(
-            a[0] * a[1] for a in orderbook["asks"][:5]
-        )
-        current_order_count = _count_active_levels(orderbook["bids"]) + _count_active_levels(
-            orderbook["asks"]
-        )
+        bid_depth = sum(b[0] * b[1] for b in orderbook["bids"][:5])
+        ask_depth = sum(a[0] * a[1] for a in orderbook["asks"][:5])
+        current_depth = bid_depth + ask_depth
+
+        bid_order_count = _count_active_levels(orderbook["bids"])
+        ask_order_count = _count_active_levels(orderbook["asks"])
+        current_order_count = bid_order_count + ask_order_count
 
         # 2. Mum Verileri (Stabilite Kontrolu)
         ohlcv = safe_fetch(exchange.fetch_ohlcv, symbol, timeframe="1m", limit=40)
@@ -192,40 +206,85 @@ def analyze_bybit(symbol, candle_index=-1):
         # 4. Derinlik Takibi
         if symbol not in depth_memory:
             depth_memory[symbol] = []
-        if len(depth_memory[symbol]) > 5:
-            depth_median = statistics.median(depth_memory[symbol])
-            if depth_median > 0:
-                depth_ratio = current_depth / depth_median
-            else:
-                depth_ratio = 1.0
-        else:
-            depth_ratio = 1.0
+        depth_ratio = _ratio_to_median(current_depth, depth_memory[symbol])
 
         depth_memory[symbol].append(current_depth)
         if len(depth_memory[symbol]) > 20:
             depth_memory[symbol].pop(0)
 
+        if symbol not in bid_depth_memory:
+            bid_depth_memory[symbol] = []
+        if symbol not in ask_depth_memory:
+            ask_depth_memory[symbol] = []
+        bid_depth_ratio = _ratio_to_median(bid_depth, bid_depth_memory[symbol])
+        ask_depth_ratio = _ratio_to_median(ask_depth, ask_depth_memory[symbol])
+
+        bid_depth_memory[symbol].append(bid_depth)
+        if len(bid_depth_memory[symbol]) > 20:
+            bid_depth_memory[symbol].pop(0)
+
+        ask_depth_memory[symbol].append(ask_depth)
+        if len(ask_depth_memory[symbol]) > 20:
+            ask_depth_memory[symbol].pop(0)
+
         if symbol not in order_count_memory:
             order_count_memory[symbol] = []
-        if len(order_count_memory[symbol]) > 5:
-            count_median = statistics.median(order_count_memory[symbol])
-            if count_median > 0:
-                order_count_ratio = current_order_count / count_median
-            else:
-                order_count_ratio = 1.0
-        else:
-            order_count_ratio = 1.0
+        order_count_ratio = _ratio_to_median(current_order_count, order_count_memory[symbol])
 
         order_count_memory[symbol].append(current_order_count)
         if len(order_count_memory[symbol]) > 20:
             order_count_memory[symbol].pop(0)
 
+        if symbol not in bid_order_count_memory:
+            bid_order_count_memory[symbol] = []
+        if symbol not in ask_order_count_memory:
+            ask_order_count_memory[symbol] = []
+        bid_order_count_ratio = _ratio_to_median(
+            bid_order_count, bid_order_count_memory[symbol]
+        )
+        ask_order_count_ratio = _ratio_to_median(
+            ask_order_count, ask_order_count_memory[symbol]
+        )
+
+        bid_order_count_memory[symbol].append(bid_order_count)
+        if len(bid_order_count_memory[symbol]) > 20:
+            bid_order_count_memory[symbol].pop(0)
+
+        ask_order_count_memory[symbol].append(ask_order_count)
+        if len(ask_order_count_memory[symbol]) > 20:
+            ask_order_count_memory[symbol].pop(0)
+
         # --- KESIN KARAR ---
         # Hacim >= 5x VE Degisim <= %0.05 VE Makas <= 5 Tick
+        dominant_side = None
+        bid_imbalance = (
+            bid_depth > 0 and ask_depth > 0 and (bid_depth / ask_depth) >= IMBALANCE_RATIO_MIN
+        )
+        ask_imbalance = (
+            bid_depth > 0 and ask_depth > 0 and (ask_depth / bid_depth) >= IMBALANCE_RATIO_MIN
+        )
+        bid_ok = (
+            bid_depth_ratio >= DEPTH_MULTIPLIER_TARGET
+            and bid_order_count_ratio >= ORDER_COUNT_MULTIPLIER_TARGET
+            and bid_imbalance
+        )
+        ask_ok = (
+            ask_depth_ratio >= DEPTH_MULTIPLIER_TARGET
+            and ask_order_count_ratio >= ORDER_COUNT_MULTIPLIER_TARGET
+            and ask_imbalance
+        )
+        if bid_ok and ask_ok:
+            dominant_side = "BOTH"
+        elif bid_ok:
+            dominant_side = "BID"
+        elif ask_ok:
+            dominant_side = "ASK"
+
         if (
             vol_ratio >= VOLUME_THRESHOLD
             and body_change <= BODY_STABILITY_PERCENT
             and order_count_ratio >= ORDER_COUNT_MULTIPLIER_TARGET
+            and dominant_side is not None
         ):
             return True, {
                 "ticks": spread_ticks,
@@ -233,7 +292,16 @@ def analyze_bybit(symbol, candle_index=-1):
                 "price": close_p,
                 "body_ch": body_change,
                 "depth_ratio": depth_ratio,
+                "bid_depth_ratio": bid_depth_ratio,
+                "ask_depth_ratio": ask_depth_ratio,
+                "bid_depth": bid_depth,
+                "ask_depth": ask_depth,
                 "order_count_ratio": order_count_ratio,
+                "bid_order_count_ratio": bid_order_count_ratio,
+                "ask_order_count_ratio": ask_order_count_ratio,
+                "bid_order_count": bid_order_count,
+                "ask_order_count": ask_order_count,
+                "dominant_side": dominant_side,
                 "order_count": current_order_count,
                 "is_wall": depth_ratio >= DEPTH_MULTIPLIER_TARGET,
                 "candle_ts": candle_ts,
@@ -323,6 +391,17 @@ def scanner_loop():
                                     f"📚 *Emir Yogunlugu:* {confirmed_data['order_count_ratio']:.2f}x "
                                     f"({confirmed_data['order_count']})"
                                 )
+                                side_line = f"🧭 *Baskin Taraf:* {confirmed_data['dominant_side']}"
+                                depth_side_line = (
+                                    "🌊 *Derinlik (B/A):* "
+                                    f"{confirmed_data['bid_depth_ratio']:.1f}x/"
+                                    f"{confirmed_data['ask_depth_ratio']:.1f}x"
+                                )
+                                count_side_line = (
+                                    "📚 *Emir (B/A):* "
+                                    f"{confirmed_data['bid_order_count_ratio']:.2f}x/"
+                                    f"{confirmed_data['ask_order_count_ratio']:.2f}x"
+                                )
 
                                 msg = (
                                     f"*{header}* ({symbol})\n\n"
@@ -332,6 +411,9 @@ def scanner_loop():
                                     f"🌊 *Derinlik:* {confirmed_data['depth_ratio']:.1f} Kat\n"
                                     f"{wall_line}\n"
                                     f"{order_count_line}\n"
+                                    f"{side_line}\n"
+                                    f"{depth_side_line}\n"
+                                    f"{count_side_line}\n"
                                     f"💰 *Fiyat:* {confirmed_data['price']}"
                                 )
 

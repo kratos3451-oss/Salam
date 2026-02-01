@@ -10,10 +10,16 @@ TELEGRAM_TOKEN = "7043903963:AAF4Y5wgayT_PwRYVX4yM91TXETlFSYoffo"
 TELEGRAM_CHAT_ID = "5448895488"
 
 # --- STRATEJI AYARLARI ---
-VOLUME_THRESHOLD = 5.0        # Hacim en az 5 KAT artmis olmali
+VOLUME_THRESHOLD = 5.0         # Hacim en az 5 KAT artmis olmali
 BODY_STABILITY_PERCENT = 0.05  # Degisim kesinlikle %0.05 ve alti olmali
-MAX_ALLOWED_TICKS = 5         # Makas 5 tick'ten fazlaysa ASLA bildirme
+MAX_ALLOWED_TICKS = 5          # Makas 5 tick'ten fazlaysa ASLA bildirme
 DEPTH_MULTIPLIER_TARGET = 3.0  # Tahta 3 kat dolmussa "DUVAR" ibaresi ekle
+COOLDOWN_SECONDS = 60
+STREAK_WINDOW_SECONDS = 130
+MARKET_CACHE_TTL_SECONDS = 1800
+SCAN_SLEEP_SECONDS = 1.2
+RETRY_ATTEMPTS = 3
+RETRY_BASE_SLEEP = 1.0
 
 # --- OZEL TAKIP LISTESI ---
 watched_coins = {
@@ -24,9 +30,13 @@ watched_coins = {
     "BIRB/USDT",
 }
 
+watched_coins_lock = threading.Lock()
 depth_memory = {}
 market_info_cache = {}
 alert_streaks = {}
+alert_last_sent = {}
+market_cache = None
+market_cache_loaded_at = 0.0
 
 exchange = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "spot"}})
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -34,20 +44,72 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 # ================= ANALIZ MOTORU =================
 
 
+RETRYABLE_EXCEPTIONS = (
+    ccxt.NetworkError,
+    ccxt.RequestTimeout,
+    ccxt.DDoSProtection,
+    ccxt.ExchangeNotAvailable,
+    ccxt.RateLimitExceeded,
+)
+
+
+def safe_fetch(callable_fn, *args, **kwargs):
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return callable_fn(*args, **kwargs)
+        except RETRYABLE_EXCEPTIONS:
+            time.sleep(RETRY_BASE_SLEEP * attempt)
+        except Exception:
+            break
+    return None
+
+
+def load_markets_cached():
+    global market_cache, market_cache_loaded_at
+    now = time.time()
+    if market_cache and now - market_cache_loaded_at < MARKET_CACHE_TTL_SECONDS:
+        return market_cache
+
+    markets = safe_fetch(exchange.load_markets)
+    if markets:
+        market_cache = markets
+        market_cache_loaded_at = now
+    return market_cache
+
+
+def _tick_size_from_market(market):
+    precision = market.get("precision", {}).get("price")
+    if precision is not None:
+        try:
+            precision_value = float(precision)
+            if precision_value.is_integer():
+                return 10 ** (-int(precision_value))
+            if precision_value > 0:
+                return precision_value
+        except (TypeError, ValueError):
+            pass
+
+    info = market.get("info") or {}
+    price_filter = info.get("priceFilter") or info.get("price_filter") or {}
+    tick = price_filter.get("tickSize") or price_filter.get("tick_size")
+    if tick is not None:
+        try:
+            return float(tick)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def get_tick_size(symbol):
     if symbol in market_info_cache:
         return market_info_cache[symbol]
     try:
-        markets = exchange.load_markets()
-        precision = markets[symbol]["precision"]["price"]
-        if precision is None:
+        markets = load_markets_cached()
+        if not markets or symbol not in markets:
             return None
-        # CCXT precision is typically decimals; convert to tick size.
-        precision_value = float(precision)
-        if precision_value.is_integer():
-            tick_size = 10 ** (-int(precision_value))
-        else:
-            tick_size = precision_value
+        tick_size = _tick_size_from_market(markets[symbol])
+        if not tick_size:
+            return None
         market_info_cache[symbol] = tick_size
         return tick_size
     except Exception:
@@ -61,10 +123,12 @@ def analyze_bybit(symbol):
             return False, None
 
         # 1. Tahta Analizi (Makas Kontrolu)
-        orderbook = exchange.fetch_order_book(symbol, limit=10)
+        orderbook = safe_fetch(exchange.fetch_order_book, symbol, limit=10)
+        if not orderbook:
+            return False, None
         bid = orderbook["bids"][0][0] if orderbook["bids"] else 0
         ask = orderbook["asks"][0][0] if orderbook["asks"] else 0
-        if not bid or not ask:
+        if not bid or not ask or ask < bid:
             return False, None
 
         spread_ticks = round((ask - bid) / tick_size)
@@ -73,12 +137,14 @@ def analyze_bybit(symbol):
         if spread_ticks > MAX_ALLOWED_TICKS:
             return False, None
 
-        current_depth = sum([b[0] * b[1] for b in orderbook["bids"][:5]]) + sum(
-            [a[0] * a[1] for a in orderbook["asks"][:5]]
+        current_depth = sum(b[0] * b[1] for b in orderbook["bids"][:5]) + sum(
+            a[0] * a[1] for a in orderbook["asks"][:5]
         )
 
         # 2. Mum Verileri (Stabilite Kontrolu)
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1m", limit=40)
+        ohlcv = safe_fetch(exchange.fetch_ohlcv, symbol, timeframe="1m", limit=40)
+        if not ohlcv or len(ohlcv) < 30:
+            return False, None
         current = ohlcv[-1]
         open_p, close_p, vol = current[1], current[4], current[5]
 
@@ -87,6 +153,8 @@ def analyze_bybit(symbol):
 
         # 3. Hacim Analizi (5 Kat Sarti)
         volumes = [c[5] for c in ohlcv[-30:-10]]
+        if not volumes:
+            return False, None
         normal_vol_m = statistics.median(volumes)
         vol_ratio = vol / (normal_vol_m if normal_vol_m > 0 else 1)
 
@@ -94,7 +162,11 @@ def analyze_bybit(symbol):
         if symbol not in depth_memory:
             depth_memory[symbol] = []
         if len(depth_memory[symbol]) > 5:
-            depth_ratio = current_depth / statistics.median(depth_memory[symbol])
+            depth_median = statistics.median(depth_memory[symbol])
+            if depth_median > 0:
+                depth_ratio = current_depth / depth_median
+            else:
+                depth_ratio = 1.0
         else:
             depth_ratio = 1.0
 
@@ -121,48 +193,65 @@ def analyze_bybit(symbol):
 # ================= ANA DONGU =================
 
 
+def should_send_alert(symbol, now):
+    last_sent = alert_last_sent.get(symbol)
+    if last_sent and now - last_sent < COOLDOWN_SECONDS:
+        return False
+    return True
+
+
+def update_streak(symbol, now):
+    if symbol not in alert_streaks:
+        alert_streaks[symbol] = {"count": 1, "last_time": now}
+    else:
+        if now - alert_streaks[symbol]["last_time"] < STREAK_WINDOW_SECONDS:
+            alert_streaks[symbol]["count"] += 1
+        else:
+            alert_streaks[symbol]["count"] = 1
+        alert_streaks[symbol]["last_time"] = now
+    return alert_streaks[symbol]["count"]
+
+
+def get_watched_symbols():
+    with watched_coins_lock:
+        return list(watched_coins)
+
+
 def scanner_loop():
     print("📡 5x Hacim & 5-Tick Radari Aktif...")
     while True:
         try:
-            for symbol in list(watched_coins):
+            for symbol in get_watched_symbols():
                 try:
                     detected, data = analyze_bybit(symbol)
                     if detected:
                         now = time.time()
-                        # Seri (Streak) Takibi
-                        if symbol not in alert_streaks:
-                            alert_streaks[symbol] = {"count": 1, "last_time": now}
-                        else:
-                            if now - alert_streaks[symbol]["last_time"] < 130:
-                                alert_streaks[symbol]["count"] += 1
-                            else:
-                                alert_streaks[symbol]["count"] = 1
-                            alert_streaks[symbol]["last_time"] = now
+                        streak = update_streak(symbol, now)
+                        if should_send_alert(symbol, now):
+                            exc = "!" * (streak - 1)
+                            header = (
+                                f"{exc} GÜÇLÜ BOT TESPİTİ {exc}"
+                                if streak > 1
+                                else "🚨 HACİM PATLAMASI"
+                            )
+                            wall_line = "🧱 *Duvar:* Evet" if data["is_wall"] else "🧱 *Duvar:* Hayır"
 
-                        streak = alert_streaks[symbol]["count"]
-                        exc = "!" * (streak - 1)
-                        header = (
-                            f"{exc} GÜÇLÜ BOT TESPİTİ {exc}"
-                            if streak > 1
-                            else "🚨 HACİM PATLAMASI"
-                        )
+                            msg = (
+                                f"*{header}* ({symbol})\n\n"
+                                f"📈 *Hacim Artışı:* {data['vol_ratio']:.1f} KAT ✅\n"
+                                f"📊 *Değişim:* %{data['body_ch']:.4f}\n"
+                                f"📏 *Makas:* {data['ticks']} Tick\n"
+                                f"🌊 *Derinlik:* {data['depth_ratio']:.1f} Kat\n"
+                                f"{wall_line}\n"
+                                f"💰 *Fiyat:* {data['price']}"
+                            )
 
-                        msg = (
-                            f"*{header}* ({symbol})\n\n"
-                            f"📈 *Hacim Artışı:* {data['vol_ratio']:.1f} KAT ✅\n"
-                            f"📊 *Değişim:* %{data['body_ch']:.4f}\n"
-                            f"📏 *Makas:* {data['ticks']} Tick\n"
-                            f"🌊 *Derinlik:* {data['depth_ratio']:.1f} Kat\n"
-                            f"💰 *Fiyat:* {data['price']}"
-                        )
-
-                        try:
-                            bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
-                        except Exception:
-                            pass
-                        time.sleep(50)
-                    time.sleep(1.2)
+                            try:
+                                bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+                                alert_last_sent[symbol] = now
+                            except Exception:
+                                pass
+                    time.sleep(SCAN_SLEEP_SECONDS)
                 except Exception:
                     time.sleep(2)
         except Exception:
@@ -177,10 +266,9 @@ def telegram_commands(message):
     try:
         cmd = message.text.split()[0]
         if "liste" in cmd:
-            bot.reply_to(
-                message,
-                "🔍 Takipteki Coinler:\n" + "\n".join(watched_coins),
-            )
+            with watched_coins_lock:
+                symbols = sorted(watched_coins)
+            bot.reply_to(message, "🔍 Takipteki Coinler:\n" + "\n".join(symbols))
         else:
             bot.reply_to(
                 message,
@@ -193,10 +281,15 @@ def telegram_commands(message):
 @bot.message_handler(commands=["ekle"])
 def add_coin(message):
     try:
-        coin = message.text.split()[1].upper()
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Kullanim: /ekle COIN (ornek: /ekle BTC)")
+            return
+        coin = parts[1].upper()
         if "/" not in coin:
             coin += "/USDT"
-        watched_coins.add(coin)
+        with watched_coins_lock:
+            watched_coins.add(coin)
         bot.reply_to(message, f"✅ {coin} eklendi.")
     except Exception:
         pass
@@ -205,10 +298,15 @@ def add_coin(message):
 @bot.message_handler(commands=["sil"])
 def remove_coin(message):
     try:
-        coin = message.text.split()[1].upper()
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Kullanim: /sil COIN (ornek: /sil BTC)")
+            return
+        coin = parts[1].upper()
         if "/" not in coin:
             coin += "/USDT"
-        watched_coins.discard(coin)
+        with watched_coins_lock:
+            watched_coins.discard(coin)
         bot.reply_to(message, f"🗑️ {coin} çıkarıldı.")
     except Exception:
         pass

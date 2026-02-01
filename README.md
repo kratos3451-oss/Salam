@@ -39,7 +39,7 @@ Eğer anlık derinlik, o coinin geçmiş derinlik ortalamasının **3 katı (3x)
 - **Komutlar:** `/ekle`, `/sil`, `/liste` komutları ile takip listesi canlı olarak güncellenebilmelidir.
 - **Seri Takibi (Streak):** Eğer bir coin üst üste birden fazla mumda aynı sinyali veriyorsa, mesajın başına her mum için bir **"!"** eklenmelidir (Örn: `!! FIRSAT DEVAM EDİYOR !!`).
 - **Spam Engelleme:** Aynı coin için başarılı bir tespitten sonra **60 saniye cooldown** (bekleme süresi) uygulanmalıdır.
-- **Mum Onayı:** Şartlar aynı mumda **60 saniye boyunca** sürerse bildirim gönderilir.
+- **Mum Onayı:** Şartlar yakalandıktan sonra, sinyal **mum kapanışında** onaylanır.
 
 ## 5. Özet Analiz Akışı (Pseudo-Code)
 

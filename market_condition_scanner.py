@@ -36,6 +36,7 @@ market_info_cache = {}
 alert_streaks = {}
 alert_last_sent = {}
 pending_alerts = {}
+last_candle_ts = {}
 market_cache = None
 market_cache_loaded_at = 0.0
 
@@ -117,26 +118,40 @@ def get_tick_size(symbol):
         return None
 
 
-def analyze_bybit(symbol):
+def _volumes_window(ohlcv, candle_index):
+    length = len(ohlcv)
+    if length == 0:
+        return []
+    idx = candle_index if candle_index >= 0 else length + candle_index
+    if idx < 0 or idx >= length:
+        return []
+    start = idx - 29
+    end = idx - 9
+    if start < 0:
+        return []
+    return [c[5] for c in ohlcv[start : end + 1]]
+
+
+def analyze_bybit(symbol, candle_index=-1):
     try:
         tick_size = get_tick_size(symbol)
         if not tick_size:
-            return False, None
+            return False, None, None
 
         # 1. Tahta Analizi (Makas Kontrolu)
         orderbook = safe_fetch(exchange.fetch_order_book, symbol, limit=10)
         if not orderbook:
-            return False, None
+            return False, None, None
         bid = orderbook["bids"][0][0] if orderbook["bids"] else 0
         ask = orderbook["asks"][0][0] if orderbook["asks"] else 0
         if not bid or not ask or ask < bid:
-            return False, None
+            return False, None, None
 
         spread_ticks = round((ask - bid) / tick_size)
 
         # KRITER: 5 tick'ten fazla makas varsa iptal
         if spread_ticks > MAX_ALLOWED_TICKS:
-            return False, None
+            return False, None, None
 
         current_depth = sum(b[0] * b[1] for b in orderbook["bids"][:5]) + sum(
             a[0] * a[1] for a in orderbook["asks"][:5]
@@ -144,18 +159,18 @@ def analyze_bybit(symbol):
 
         # 2. Mum Verileri (Stabilite Kontrolu)
         ohlcv = safe_fetch(exchange.fetch_ohlcv, symbol, timeframe="1m", limit=40)
-        if not ohlcv or len(ohlcv) < 30:
-            return False, None
-        current = ohlcv[-1]
+        if not ohlcv or len(ohlcv) < 31:
+            return False, None, None
+        current = ohlcv[candle_index]
         candle_ts, open_p, close_p, vol = current[0], current[1], current[4], current[5]
 
         # Fiyat Degisimi (Body Change)
         body_change = abs(close_p - open_p) / (open_p if open_p > 0 else 1) * 100
 
         # 3. Hacim Analizi (5 Kat Sarti)
-        volumes = [c[5] for c in ohlcv[-30:-10]]
+        volumes = _volumes_window(ohlcv, candle_index)
         if not volumes:
-            return False, None
+            return False, None, candle_ts
         normal_vol_m = statistics.median(volumes)
         vol_ratio = vol / (normal_vol_m if normal_vol_m > 0 else 1)
 
@@ -186,10 +201,10 @@ def analyze_bybit(symbol):
                 "depth_ratio": depth_ratio,
                 "is_wall": depth_ratio >= DEPTH_MULTIPLIER_TARGET,
                 "candle_ts": candle_ts,
-            }
-        return False, None
+            }, candle_ts
+        return False, None, candle_ts
     except Exception:
-        return False, None
+        return False, None, None
 
 
 # ================= ANA DONGU =================
@@ -219,21 +234,17 @@ def get_watched_symbols():
         return list(watched_coins)
 
 
-def update_pending_alert(symbol, candle_ts, now, data):
+def update_pending_alert(symbol, candle_ts, data):
     pending = pending_alerts.get(symbol)
     if not pending or pending["candle_ts"] != candle_ts:
         pending_alerts[symbol] = {
             "candle_ts": candle_ts,
-            "first_seen": now,
             "data": data,
         }
         return None
 
     pending["data"] = data
-    if now - pending["first_seen"] >= 60:
-        pending_alerts.pop(symbol, None)
-        return pending["data"]
-    return None
+    return pending["data"]
 
 
 def clear_pending_alert(symbol):
@@ -246,41 +257,60 @@ def scanner_loop():
         try:
             for symbol in get_watched_symbols():
                 try:
-                    detected, data = analyze_bybit(symbol)
-                    if detected:
-                        now = time.time()
-                        confirmed = update_pending_alert(symbol, data["candle_ts"], now, data)
-                        if confirmed and should_send_alert(symbol, now):
-                            streak = update_streak(symbol, now)
-                            exc = "!" * (streak - 1)
-                            header = (
-                                f"{exc} GÜÇLÜ BOT TESPİTİ {exc}"
-                                if streak > 1
-                                else "🚨 HACİM PATLAMASI"
-                            )
-                            wall_line = (
-                                "🧱 *Duvar:* Evet"
-                                if confirmed["is_wall"]
-                                else "🧱 *Duvar:* Hayır"
-                            )
+                    detected, data, candle_ts = analyze_bybit(symbol)
+                    if candle_ts is None:
+                        time.sleep(SCAN_SLEEP_SECONDS)
+                        continue
 
-                            msg = (
-                                f"*{header}* ({symbol})\n\n"
-                                f"📈 *Hacim Artışı:* {confirmed['vol_ratio']:.1f} KAT ✅\n"
-                                f"📊 *Değişim:* %{confirmed['body_ch']:.4f}\n"
-                                f"📏 *Makas:* {confirmed['ticks']} Tick\n"
-                                f"🌊 *Derinlik:* {confirmed['depth_ratio']:.1f} Kat\n"
-                                f"{wall_line}\n"
-                                f"💰 *Fiyat:* {confirmed['price']}"
+                    previous_ts = last_candle_ts.get(symbol)
+                    if previous_ts and candle_ts != previous_ts:
+                        pending = pending_alerts.get(symbol)
+                        if pending and pending["candle_ts"] == previous_ts:
+                            confirmed, confirmed_data, _ = analyze_bybit(
+                                symbol, candle_index=-2
                             )
+                            if confirmed and should_send_alert(symbol, time.time()):
+                                now = time.time()
+                                streak = update_streak(symbol, now)
+                                exc = "!" * (streak - 1)
+                                header = (
+                                    f"{exc} GÜÇLÜ BOT TESPİTİ {exc}"
+                                    if streak > 1
+                                    else "🚨 HACİM PATLAMASI"
+                                )
+                                wall_line = (
+                                    "🧱 *Duvar:* Evet"
+                                    if confirmed_data["is_wall"]
+                                    else "🧱 *Duvar:* Hayır"
+                                )
 
-                            try:
-                                bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
-                                alert_last_sent[symbol] = now
-                            except Exception:
-                                pass
-                    else:
+                                msg = (
+                                    f"*{header}* ({symbol})\n\n"
+                                    f"📈 *Hacim Artışı:* {confirmed_data['vol_ratio']:.1f} KAT ✅\n"
+                                    f"📊 *Değişim:* %{confirmed_data['body_ch']:.4f}\n"
+                                    f"📏 *Makas:* {confirmed_data['ticks']} Tick\n"
+                                    f"🌊 *Derinlik:* {confirmed_data['depth_ratio']:.1f} Kat\n"
+                                    f"{wall_line}\n"
+                                    f"💰 *Fiyat:* {confirmed_data['price']}"
+                                )
+
+                                try:
+                                    bot.send_message(
+                                        TELEGRAM_CHAT_ID, msg, parse_mode="Markdown"
+                                    )
+                                    alert_last_sent[symbol] = now
+                                except Exception:
+                                    pass
                         clear_pending_alert(symbol)
+
+                    if detected:
+                        update_pending_alert(symbol, data["candle_ts"], data)
+                    else:
+                        pending = pending_alerts.get(symbol)
+                        if pending and pending["candle_ts"] == candle_ts:
+                            clear_pending_alert(symbol)
+
+                    last_candle_ts[symbol] = candle_ts
                     time.sleep(SCAN_SLEEP_SECONDS)
                 except Exception:
                     time.sleep(2)

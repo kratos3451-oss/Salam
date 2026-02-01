@@ -35,6 +35,7 @@ depth_memory = {}
 market_info_cache = {}
 alert_streaks = {}
 alert_last_sent = {}
+pending_alerts = {}
 market_cache = None
 market_cache_loaded_at = 0.0
 
@@ -146,7 +147,7 @@ def analyze_bybit(symbol):
         if not ohlcv or len(ohlcv) < 30:
             return False, None
         current = ohlcv[-1]
-        open_p, close_p, vol = current[1], current[4], current[5]
+        candle_ts, open_p, close_p, vol = current[0], current[1], current[4], current[5]
 
         # Fiyat Degisimi (Body Change)
         body_change = abs(close_p - open_p) / (open_p if open_p > 0 else 1) * 100
@@ -184,6 +185,7 @@ def analyze_bybit(symbol):
                 "body_ch": body_change,
                 "depth_ratio": depth_ratio,
                 "is_wall": depth_ratio >= DEPTH_MULTIPLIER_TARGET,
+                "candle_ts": candle_ts,
             }
         return False, None
     except Exception:
@@ -217,6 +219,27 @@ def get_watched_symbols():
         return list(watched_coins)
 
 
+def update_pending_alert(symbol, candle_ts, now, data):
+    pending = pending_alerts.get(symbol)
+    if not pending or pending["candle_ts"] != candle_ts:
+        pending_alerts[symbol] = {
+            "candle_ts": candle_ts,
+            "first_seen": now,
+            "data": data,
+        }
+        return None
+
+    pending["data"] = data
+    if now - pending["first_seen"] >= 60:
+        pending_alerts.pop(symbol, None)
+        return pending["data"]
+    return None
+
+
+def clear_pending_alert(symbol):
+    pending_alerts.pop(symbol, None)
+
+
 def scanner_loop():
     print("📡 5x Hacim & 5-Tick Radari Aktif...")
     while True:
@@ -226,24 +249,29 @@ def scanner_loop():
                     detected, data = analyze_bybit(symbol)
                     if detected:
                         now = time.time()
-                        streak = update_streak(symbol, now)
-                        if should_send_alert(symbol, now):
+                        confirmed = update_pending_alert(symbol, data["candle_ts"], now, data)
+                        if confirmed and should_send_alert(symbol, now):
+                            streak = update_streak(symbol, now)
                             exc = "!" * (streak - 1)
                             header = (
                                 f"{exc} GÜÇLÜ BOT TESPİTİ {exc}"
                                 if streak > 1
                                 else "🚨 HACİM PATLAMASI"
                             )
-                            wall_line = "🧱 *Duvar:* Evet" if data["is_wall"] else "🧱 *Duvar:* Hayır"
+                            wall_line = (
+                                "🧱 *Duvar:* Evet"
+                                if confirmed["is_wall"]
+                                else "🧱 *Duvar:* Hayır"
+                            )
 
                             msg = (
                                 f"*{header}* ({symbol})\n\n"
-                                f"📈 *Hacim Artışı:* {data['vol_ratio']:.1f} KAT ✅\n"
-                                f"📊 *Değişim:* %{data['body_ch']:.4f}\n"
-                                f"📏 *Makas:* {data['ticks']} Tick\n"
-                                f"🌊 *Derinlik:* {data['depth_ratio']:.1f} Kat\n"
+                                f"📈 *Hacim Artışı:* {confirmed['vol_ratio']:.1f} KAT ✅\n"
+                                f"📊 *Değişim:* %{confirmed['body_ch']:.4f}\n"
+                                f"📏 *Makas:* {confirmed['ticks']} Tick\n"
+                                f"🌊 *Derinlik:* {confirmed['depth_ratio']:.1f} Kat\n"
                                 f"{wall_line}\n"
-                                f"💰 *Fiyat:* {data['price']}"
+                                f"💰 *Fiyat:* {confirmed['price']}"
                             )
 
                             try:
@@ -251,6 +279,8 @@ def scanner_loop():
                                 alert_last_sent[symbol] = now
                             except Exception:
                                 pass
+                    else:
+                        clear_pending_alert(symbol)
                     time.sleep(SCAN_SLEEP_SECONDS)
                 except Exception:
                     time.sleep(2)

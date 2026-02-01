@@ -16,7 +16,6 @@ DEPTH_MULTIPLIER_TARGET = 3.0  # Tahta 3 kat dolmussa "DUVAR" ibaresi ekle
 ORDERBOOK_LIMIT = 20
 ORDER_COUNT_MIN_NOTIONAL = 5.0
 ORDER_COUNT_MULTIPLIER_TARGET = 1.5
-IMBALANCE_RATIO_MIN = 1.3
 COOLDOWN_SECONDS = 60
 STREAK_WINDOW_SECONDS = 130
 SCAN_SLEEP_SECONDS = 1.2
@@ -189,35 +188,21 @@ def analyze_bybit(symbol, candle_index=-1):
 
         # --- KESIN KARAR ---
         # Hacim >= 5x VE Degisim <= %0.05
-        dominant_side = None
-        bid_imbalance = (
-            bid_depth > 0 and ask_depth > 0 and (bid_depth / ask_depth) >= IMBALANCE_RATIO_MIN
-        )
-        ask_imbalance = (
-            bid_depth > 0 and ask_depth > 0 and (ask_depth / bid_depth) >= IMBALANCE_RATIO_MIN
-        )
         bid_ok = (
             bid_depth_ratio >= DEPTH_MULTIPLIER_TARGET
             and bid_order_count_ratio >= ORDER_COUNT_MULTIPLIER_TARGET
-            and bid_imbalance
         )
         ask_ok = (
             ask_depth_ratio >= DEPTH_MULTIPLIER_TARGET
             and ask_order_count_ratio >= ORDER_COUNT_MULTIPLIER_TARGET
-            and ask_imbalance
         )
-        if bid_ok and ask_ok:
-            dominant_side = "BOTH"
-        elif bid_ok:
-            dominant_side = "BID"
-        elif ask_ok:
-            dominant_side = "ASK"
+        both_sides_ok = bid_ok and ask_ok
 
         if (
             vol_ratio >= VOLUME_THRESHOLD
             and body_change <= BODY_STABILITY_PERCENT
             and order_count_ratio >= ORDER_COUNT_MULTIPLIER_TARGET
-            and dominant_side is not None
+            and both_sides_ok
         ):
             return True, {
                 "vol_ratio": vol_ratio,
@@ -233,7 +218,7 @@ def analyze_bybit(symbol, candle_index=-1):
                 "ask_order_count_ratio": ask_order_count_ratio,
                 "bid_order_count": bid_order_count,
                 "ask_order_count": ask_order_count,
-                "dominant_side": dominant_side,
+                "dominant_side": "BOTH",
                 "order_count": current_order_count,
                 "is_wall": depth_ratio >= DEPTH_MULTIPLIER_TARGET,
                 "candle_ts": candle_ts,
@@ -323,7 +308,7 @@ def scanner_loop():
                                     f"📚 *Emir Yogunlugu:* {confirmed_data['order_count_ratio']:.2f}x "
                                     f"({confirmed_data['order_count']})"
                                 )
-                                side_line = f"🧭 *Baskin Taraf:* {confirmed_data['dominant_side']}"
+                                side_line = f"🧭 *Taraf:* {confirmed_data['dominant_side']}"
                                 depth_side_line = (
                                     "🌊 *Derinlik (B/A):* "
                                     f"{confirmed_data['bid_depth_ratio']:.1f}x/"

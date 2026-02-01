@@ -28,8 +28,8 @@ Hacim patlamasına rağmen fiyatın ilerleyemediğini doğrulamak için; 1 dakik
 **C. Emir Yogunlugu Artisi (Order Count Spike)**  
 Tahtanin ilk seviyelerinde, anlamli tutardaki emir sayisi (notional >= belirli esik) **gecmis ortalamaya gore artmis** olmalidir. Bu, fiyat sabitken "suni emir yigmalarini" ayirt etmeye yardim eder.
 
-**D. Tek Tarafli Emir Yigma (Side Imbalance)**  
-Piyasa yapici/absorpsiyon davranisi icin, emir yogunlugu ve derinlik artisi **tek bir tarafta** (bid veya ask) belirgin olmalidir. Bu sayede "her iki tarafta eszamanli likidite artisi" gibi alakasiz durumlar elenir.
+**D. Cift Tarafli Emir Yigma (Two-Sided Build-up)**  
+Emir yogunlugu ve derinlik artisi **hem bid hem de ask tarafinda** belirgin olmalidir. Bu sayede, hacim artisi sadece tek tarafli degil, genel bir likidite baskisi ile dogrulanir.
 
 ## 3. Dinamik Derinlik Takibi (Order Book Analysis)
 

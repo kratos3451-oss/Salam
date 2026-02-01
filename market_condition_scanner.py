@@ -1,4 +1,3 @@
-import os
 import statistics
 import threading
 import time
@@ -7,11 +6,8 @@ import ccxt
 import telebot
 
 # ================= AYARLAR (KATI FILTRE) =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID environment variables.")
+TELEGRAM_TOKEN = "7043903963:AAF4Y5wgayT_PwRYVX4yM91TXETlFSYoffo"
+TELEGRAM_CHAT_ID = "5448895488"
 
 # --- STRATEJI AYARLARI ---
 VOLUME_THRESHOLD = 5.0        # Hacim en az 5 KAT artmis olmali
